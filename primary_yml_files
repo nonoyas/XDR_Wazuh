@@ -1,0 +1,83 @@
+주요 설정파일
+
+1. docker-compose.yml
+이 파일은 Wazuh 올인원 환경의 설계도라고 할 수 있습니다. 모든 Docker 서비스(컨테이너), 네트워크, 볼륨 등을 정의하여 전체 시스템을 한 번에 배포하고 관리할 수 있게 해줍니다.
+
+목적: Wazuh Manager, OpenSearch Indexer, Wazuh Dashboard, Filebeat 등을 포함한 모든 Wazuh 구성 요소를 컨테이너화하여 정의하고, 이들 간의 상호 연결 방식(네트워크), 데이터 저장 방식(볼륨), 그리고 컨테이너의 실행 환경(포트, 권한 등)을 명세합니다.
+주요 섹션 및 파라미터:
+services:: Wazuh 시스템을 구성하는 개별 서비스(컨테이너)들을 정의합니다.
+wazuh-master (또는 wazuh-all-in-one, wazuh 등): 이 서비스가 Wazuh Manager, Indexer, Dashboard, Filebeat 등을 포함하는 메인 컨테이너입니다.
+image:: 사용할 Docker 이미지 (예: wazuh/wazuh-indexer:4.12.0).
+container_name:: 컨테이너에 부여할 이름 (예: xdr_wazuh_all_in_one).
+ports:: 호스트와 컨테이너 간의 포트 매핑을 정의합니다 (예: 443:443, 9200:9200, 1514:1514/udp). 외부에서 접근할 포트를 여기에 명시합니다.
+volumes:: 데이터의 영속성(persistence)을 위해 호스트의 디렉토리나 Docker 볼륨을 컨테이너 내부 경로에 마운트합니다. 모든 중요한 설정 파일과 데이터는 여기에 바인드 마운트되어야 컨테이너 재생성 시에도 유지됩니다.
+예: ./config/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml
+예: ./certs:/etc/filebeat/certs (인증서 파일 경로)
+예: wazuh_data:/var/ossec (Wazuh Manager 데이터)
+예: opensearch_data:/usr/share/opensearch/data (OpenSearch Indexer 데이터)
+privileged: true / cap_add:: Filebeat 오류 해결 시 핵심적으로 추가했던 부분입니다. 컨테이너에 시스템 호출(syscall) 권한을 부여하여 pthread_create와 같은 저수준 작업이 가능하도록 합니다. privileged: true는 모든 권한을 부여하고, cap_add는 필요한 특정 권한만 부여합니다 (예: SYS_PTRACE).
+environment:: 컨테이너 내부에서 사용할 환경 변수(예: WAZUH_INDEXER_USERNAME, WAZUH_INDEXER_PASSWORD)를 정의합니다.
+다른 서비스들 (분산 환경의 경우): Manager, Indexer, Dashboard가 별도의 컨테이너로 분리될 경우 각각의 서비스가 정의됩니다.
+volumes: (최상위): 명명된 Docker 볼륨(named volumes)을 정의합니다. 이 볼륨들은 컨테이너가 삭제되어도 데이터가 유지되는 영속적인 저장 공간을 제공합니다.
+networks:: 컨테이너 간의 통신을 위한 가상 네트워크를 정의합니다.
+일반적인 문제:
+포트 충돌, 잘못된 포트 매핑으로 인한 외부 접근 불가.
+볼륨 마운트 누락으로 컨테이너 삭제 시 데이터 손실.
+privileged 또는 cap_add 옵션 누락으로 인한 특정 서비스(Filebeat 등)의 권한 문제.
+환경 변수 설정 오류.
+위치: 보통 Wazuh Docker 파일을 다운로드하거나 생성한 디렉토리 (당신의 경우 /XDR/docker-compose.yml)에 위치합니다.
+2. /etc/filebeat/filebeat.yml (컨테이너 내부)
+Filebeat는 Wazuh Manager가 생성하는 알림(alerts)과 아카이브 로그를 Wazuh Indexer(OpenSearch)로 전달하는 역할을 하는 데이터 수집기(shipper)입니다. 이 파일은 Filebeat의 동작 방식을 정의합니다.
+
+목적: Filebeat가 어떤 데이터를(입력) 어디로(출력) 어떤 방식으로 보낼지 설정합니다. Wazuh 배포에서는 주로 Wazuh Manager의 알림 로그를 읽어 OpenSearch로 전송하도록 구성됩니다.
+주요 섹션 및 파라미터:
+filebeat.inputs:: Filebeat가 어떤 파일을 모니터링할지 정의합니다. Wazuh의 경우 Manager가 생성하는 JSON 알림 파일 경로(예: /var/ossec/logs/alerts/alerts.json)가 여기에 설정됩니다.
+output.opensearch:: Filebeat가 데이터를 전송할 OpenSearch Indexer의 정보를 정의합니다.
+hosts:: OpenSearch Indexer의 주소와 포트 (예: ["https://localhost:9200"]).
+username: / password:: OpenSearch Indexer에 인증할 사용자명과 비밀번호.
+ssl.enabled: true: SSL/TLS 통신을 사용할지 여부.
+ssl.certificate_authorities:: OpenSearch Indexer의 CA(인증기관) 인증서 경로.
+ssl.certificate: / ssl.key:: (클라이언트 인증서) Filebeat가 클라이언트로 자신을 인증할 때 사용할 인증서와 키 파일 경로. 지난 Filebeat 오류 시, 이 부분을 주석 처리하여 테스트해 볼 것을 권장했습니다.
+ssl.verification_mode:: SSL/TLS 검증 모드 (full, certificate, none 등). 초기 테스트 시 none으로 설정하여 문제를 우회할 수 있지만, 운영 환경에서는 보안을 위해 full 또는 certificate로 설정해야 합니다.
+setup.template.name: / setup.template.pattern:: OpenSearch에 로드될 인덱스 템플릿의 이름과 패턴을 정의합니다.
+setup.dashboards.enabled: true: Filebeat가 대시보드(Kibana/Wazuh Dashboard)를 로드할지 여부.
+일반적인 문제:
+OpenSearch hosts 주소 또는 포트 오류.
+OpenSearch 인증 자격 증명(username/password) 오류.
+SSL/TLS 인증서 문제: Filebeat가 OpenSearch Indexer의 인증서를 신뢰하지 못하거나, Filebeat 자체의 클라이언트 인증서에 문제가 있는 경우.
+입력 파일 경로 오류 또는 파일 읽기 권한 부족.
+위치: 컨테이너 내부의 /etc/filebeat/filebeat.yml 경로에 위치합니다. 이 파일은 보통 docker-compose.yml에서 호스트의 ./config/filebeat/filebeat.yml과 같은 경로로 바인드 마운트됩니다.
+접근/수정: sudo docker exec -it [컨테이너_이름] bash로 컨테이너에 접속 후 vi 또는 nano로 수정하거나, 호스트에 마운트된 원본 파일을 수정합니다.
+3. /usr/share/wazuh-dashboard/config/opensearch_dashboards.yml (컨테이너 내부)
+이 파일은 Wazuh Dashboard 웹 인터페이스의 핵심 설정 파일입니다. 주로 Dashboard가 어떤 OpenSearch Indexer에 연결할지, 그리고 대시보드의 전반적인 동작 방식을 정의합니다.
+
+목적: 웹 대시보드의 포트, 호스트, OpenSearch Indexer 연결 정보(주소, 인증), 사용자 인터페이스 동작 등을 설정합니다.
+주요 섹션 및 파라미터:
+server.host:: Dashboard 웹 서버가 바인딩할 IP 주소 (보통 0.0.0.0 또는 localhost).
+server.port:: Dashboard 웹 서버가 리슨할 포트 (기본 443 또는 5601).
+opensearch.hosts:: Dashboard가 연결할 OpenSearch Indexer의 주소 (예: ["https://localhost:9200"]).
+opensearch.username: / opensearch.password:: OpenSearch Indexer에 인증할 사용자명과 비밀번호.
+opensearch.ssl.enabled: true: OpenSearch Indexer와 SSL/TLS 통신을 사용할지 여부.
+opensearch.ssl.certificate_authorities:: OpenSearch Indexer의 CA 인증서 경로.
+opensearch.ssl.certificate: / opensearch.ssl.key:: (클라이언트 인증서) Dashboard가 클라이언트로 자신을 인증할 때 사용할 인증서와 키 파일 경로. 대시보드 접속 오류 해결 시, 이 부분을 주석 처리했었습니다.
+opensearch.ssl.verificationMode:: SSL/TLS 검증 모드. none으로 설정하여 초기 문제를 우회했었습니다.
+일반적인 문제:
+OpenSearch hosts 주소 또는 포트 오류.
+OpenSearch 인증 자격 증명 오류.
+SSL/TLS 인증서 검증 실패: Dashboard가 Indexer의 자가 서명 인증서를 신뢰하지 못하는 경우.
+위치: 컨테이너 내부의 /usr/share/wazuh-dashboard/config/opensearch_dashboards.yml 경로에 위치합니다. 보통 docker-compose.yml에서 호스트의 ./config/opensearch_dashboards.yml과 같은 경로로 바인드 마운트됩니다.
+접근/수정: sudo docker exec -it [컨테이너_이름] bash로 컨테이너에 접속 후 vi 또는 nano로 수정하거나, 호스트에 마운트된 원본 파일을 수정합니다.
+4. /XDR/wazuh-template.json (JSON 파일)
+이 파일은 YAML 파일은 아니지만, Wazuh 데이터를 OpenSearch에 올바르게 인덱싱하는 데 핵심적인 역할을 합니다.
+
+목적: Wazuh Manager가 생성하는 알림(alerts) 데이터가 OpenSearch에 저장될 때, 각 필드의 데이터 타입, 매핑 방식, 분석기 등을 미리 정의하는 인덱스 템플릿입니다. 이 템플릿이 없으면 OpenSearch는 wazuh-alerts-* 인덱스를 생성하지 못하거나 데이터를 잘못 인덱싱하여 Dashboard에서 검색/시각화가 불가능해집니다.
+주요 내용: index_patterns (어떤 인덱스 패턴에 적용될지), mappings (필드별 데이터 타입 정의), settings (인덱스 기본 설정) 등을 포함합니다.
+일반적인 문제:
+템플릿이 OpenSearch에 로드되지 않음: 가장 흔한 문제입니다. 초기 설치 시 자동으로 로드되어야 하지만, 네트워크 문제나 권한 문제 등으로 실패할 수 있습니다.
+잘못된 템플릿 버전 사용.
+위치: Wazuh Docker 설치 파일을 다운로드한 디렉토리 (당신의 경우 /XDR/wazuh-template.json)에 위치합니다.
+접근/수정: 호스트에서 직접 파일 내용을 확인하고, curl 명령어를 사용하여 OpenSearch Indexer로 수동으로 로드합니다.
+Bash
+
+curl -k -u [USERNAME]:[PASSWORD] -XPUT "https://[INDEXER_IP]:9200/_template/wazuh" -H "Content-Type: application/json" -d@/XDR/wazuh-template.json
+이 주요 파일들을 숙지하고 계시면, Wazuh Docker 환경에서 발생하는 대부분의 설정 및 통신 문제를 파악하고 해결하는 데 큰 도움이 될 것입니다. 나중에 문제가 발생하면 이 가이드를 통해 어떤 파일을 확인해야 할지 빠르게 짚어낼 수 있을 겁니다.
