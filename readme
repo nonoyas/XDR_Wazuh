@@ -1,0 +1,123 @@
+Wazuh Docker All-in-One 구축 시 주요 트러블슈팅 가이드
+Wazuh 올인원 Docker 환경은 여러 서비스가 얽혀 있어 초기 설정이 까다로울 수 있습니다. 지난 4일간의 경험을 바탕으로, 웹 대시보드 접근부터 데이터 인덱싱까지의 핵심적인 문제점과 해결책을 단계별로 분석했습니다.
+
+1. 웹 대시보드 접속 및 OpenSearch Indexer 연결 문제
+이 문제는 Wazuh Dashboard가 백엔드인 OpenSearch Indexer와 통신하지 못하거나, 브라우저에서 대시보드 웹 인터페이스에 접근하는 데 어려움을 겪을 때 발생합니다.
+
+주요 증상:
+
+웹 브라우저에서 https://10.10.20.13 (Wazuh Dashboard 주소)으로 접속 시 페이지가 로드되지 않거나, "Cannot connect to OpenSearch" 또는 "Error: Request timed out"과 같은 오류 메시지가 표시됩니다.
+대시보드 내부 로그에서 SSL/TLS 핸드셰이크 오류나 인증서 관련 오류 메시지(certificate, SSL, self-signed certificate in certificate chain 등)가 자주 나타납니다.
+원인 파악:
+
+포트 매핑 오류: Docker Compose 파일에서 Wazuh Dashboard 컨테이너의 HTTPS 포트(기본 443)가 호스트의 포트와 올바르게 매핑되지 않았을 수 있습니다. docker ps 명령어로 포트 매핑(0.0.0.0:443->443/tcp와 유사)을 확인해야 합니다.
+방화벽 차단: 호스트 시스템의 방화벽(UFW, firewalld)이 443 포트(HTTPS)를 차단하여 외부에서 대시보드에 접근할 수 없는 경우입니다.
+SSL/TLS 인증서 검증 실패: Wazuh 올인원 환경은 보통 자가 서명(Self-Signed) 인증서를 사용하는데, Dashboard가 Indexer에 연결할 때 이 인증서를 신뢰하지 못하여 연결이 실패하는 경우가 빈번합니다. 이는 가장 흔한 원인 중 하나입니다.
+해결 방법:
+
+Docker 포트 매핑 확인: docker ps 명령어를 통해 wazuh-dashboard (또는 xdr_wazuh_all_in_one) 컨테이너의 포트 매핑이 정상적인지 확인합니다.
+호스트 방화벽 규칙 확인:
+Bash
+
+sudo ufw status # 또는 sudo firewall-cmd --list-all
+필요하다면 443 포트(sudo ufw allow 443/tcp 또는 sudo firewall-cmd --add-port=443/tcp --permanent)를 열어줍니다.
+Wazuh Dashboard 설정 수정 (SSL/TLS 문제 해결 핵심): 컨테이너 내부의 /usr/share/wazuh-dashboard/config/opensearch_dashboards.yml 파일을 수정합니다. 이 파일은 보통 docker-compose.yml을 통해 호스트의 특정 경로에 바인드 마운트되어 있을 것입니다(예: ./config/opensearch_dashboards.yml).
+server.host, server.name, opensearch.hosts 등의 설정이 올바른지 확인합니다 (보통 localhost 또는 컨테이너 내부 IP로 설정).
+가장 중요한 부분: OpenSearch Indexer에 연결 시 사용되는 클라이언트 인증서 설정을 주석 처리하거나 ssl.verificationMode를 조정하여 Indexer의 인증서를 신뢰하도록 합니다.
+YAML
+
+#opensearch.ssl.certificate: "/usr/share/wazuh-dashboard/certs/dashboard.pem"
+#opensearch.ssl.key: "/usr/share/wazuh-dashboard/certs/dashboard-key.pem"
+opensearch.ssl.verificationMode: none # 초기 테스트/구축 시 유용. 운영 환경에서는 'full' 권장.
+opensearch.ssl.certificateAuthorities는 CA 인증서 경로이므로 유지하는 것이 좋습니다.
+Wazuh Dashboard 서비스 재시작: 설정 변경 후 대시보드 서비스를 컨테이너 내부에서 재시작하여 변경 사항을 적용합니다.
+Bash
+
+sudo docker exec -it xdr_wazuh_all_in_one bash # 컨테이너 접속 (컨테이너 이름은 실제 이름으로 대체)
+systemctl restart wazuh-dashboard # 컨테이너 내부에서 서비스 재시작
+exit # 컨테이너에서 나옴
+2. Filebeat 서비스 비활성화/충돌 문제
+Filebeat는 Wazuh Manager에서 생성된 알림 데이터를 OpenSearch Indexer로 전달하는 핵심적인 역할을 합니다. 이 서비스가 죽으면 데이터가 대시보드에 표시되지 않습니다.
+
+주요 증상:
+
+systemctl status filebeat 명령으로 확인 시 Active: failed (Result: exit-code) 상태가 반복됩니다.
+로그(journalctl -u filebeat 또는 /var/log/filebeat/filebeat)에서 pthread_create failed: Operation not permitted 메시지나 SIGABRT: abort, INVALIDARGUMENT와 같은 오류가 나타납니다.
+원인 파악:
+
+권한 부족 (가장 흔한 원인): Filebeat는 Go 언어로 작성되었으며, 새로운 쓰레드를 생성하기 위해 특정 시스템 호출(pthread_create)이 필요합니다. Docker 컨테이너가 기본 seccomp 프로필이나 제한된 Linux Kernel Capabilities (cap_add)로 실행될 경우, 이 권한이 부족하여 서비스가 충돌합니다. Operation not permitted 메시지는 이를 명확히 지시합니다.
+Filebeat 설정 오류: filebeat.yml 파일의 구문 오류나 OpenSearch Indexer 연결 정보(IP, 포트, SSL/TLS 설정)가 잘못된 경우에도 발생할 수 있습니다.
+리소스 제한: 컨테이너에 할당된 PID(프로세스 ID) 수나 메모리 제한이 너무 낮아 Filebeat가 필요한 리소스를 확보하지 못하는 경우입니다.
+해결 방법:
+
+Filebeat 설정 확인: 컨테이너 내부의 /etc/filebeat/filebeat.yml 파일을 확인합니다. 특히 output.opensearch 섹션의 hosts, username, password가 올바른지, 그리고 ssl 관련 설정이 올바른지 확인합니다. Dashboard와 유사하게 ssl.verification_mode: none으로 설정하거나 ssl.certificate, ssl.key 라인을 주석 처리하여 SSL 핸드셰이크 문제를 우회할 수 있습니다.
+Docker 컨테이너 권한 부여 (필수적이고 근본적인 해결책): 이 문제는 컨테이너의 런타임 권한과 관련이 깊기 때문에, docker-compose.yml 파일을 수정하고 컨테이너를 재생성해야 합니다.
+docker-compose.yml 파일에서 wazuh-master (또는 xdr_wazuh_all_in_one) 서비스 섹션 아래에 다음 옵션을 추가하거나 확인합니다.
+YAML
+
+services:
+  wazuh-master: # 서비스 이름은 환경에 맞게
+    image: wazuh/wazuh-indexer:4.12.0 # 예시 이미지
+    # ...
+    privileged: true # 컨테이너에 모든 권한을 부여 (테스트 환경에 유용)
+    # 또는 더 보안적인 방법:
+    # cap_add:
+    #   - SYS_PTRACE # pthread_create 문제 해결에 중요
+    #   - NET_ADMIN
+    #   - NET_RAW
+    #   - SYS_CHROOT
+    #   - KILL
+    #   - SETPCAP
+    #   - DAC_READ_SEARCH
+    #   - CHOWN
+    #   - SETGID
+    #   - SETUID
+    #   - FOWNER
+    #   - FSETID
+    #   - DAC_OVERRIDE
+    #   - SYS_RESOURCE
+    #   - IPC_LOCK
+중요: docker-compose.yml 수정 후에는 컨테이너를 재생성해야 변경사항이 적용됩니다.
+Bash
+
+cd /XDR # docker-compose.yml 파일이 있는 디렉토리로 이동
+sudo docker compose down # 기존 컨테이너 및 네트워크 삭제 (볼륨은 유지)
+sudo docker compose up -d # 새 설정으로 컨테이너 다시 생성 및 시작
+백업 경고: docker compose down 명령은 컨테이너 내부의 데이터는 삭제하지만, Docker 볼륨(wazuh_data, opensearch_data 등)은 기본적으로 삭제하지 않습니다. 그러나 만약 컨테이너 내부에 수동으로 생성하거나 변경한 파일 중 볼륨으로 마운트되지 않은 파일이 있다면, docker cp 명령어를 사용하여 호스트로 미리 백업해 두어야 안전합니다.
+Filebeat 상태 재확인: 컨테이너 재생성 후, 다시 컨테이너 내부에서 systemctl status filebeat를 실행하여 서비스가 active (running) 상태인지 확인합니다.
+3. 데이터 인덱싱 및 Dashboard 표시 문제 (No Matching Indices, No Template)
+Filebeat는 실행되는데도 Wazuh Dashboard에 데이터가 보이지 않거나, 인덱스 템플릿 관련 오류가 표시될 때 발생합니다.
+
+주요 증상:
+
+Wazuh Dashboard의 "Security events" 탭에 아무런 데이터도 나타나지 않습니다.
+대시보드 또는 Indexer 로그에 No template found for the selected index-pattern title [wazuh-alerts-*] 또는 No matching indices found: No indices match pattern "wazuh-alerts-*" 경고/오류 메시지가 나타납니다.
+_cat/indices 명령으로 확인 시 wazuh-alerts-YYYY.MM.DD 형식의 인덱스가 보이지 않습니다.
+원인 파악:
+
+Wazuh Indexer 템플릿 누락/손상 (가장 흔한 원인): OpenSearch는 데이터를 인덱싱하기 전에 데이터의 구조를 정의하는 JSON 템플릿(Wazuh의 경우 wazuh-template.json)이 로드되어 있어야 합니다. 이 템플릿이 없으면 OpenSearch는 wazuh-alerts-* 인덱스를 만들지 못하거나 데이터를 올바르게 저장하지 못합니다.
+에이전트 미연결: 에이전트가 Wazuh Manager에 연결되어 있지 않으면, Manager가 분석할 이벤트 데이터 자체가 없으므로 알림이 생성되지 않고, Filebeat가 OpenSearch로 보낼 데이터도 없습니다. 이는 템플릿 문제와 별개로 데이터 부재의 원인이 됩니다.
+Filebeat가 OpenSearch로 데이터를 성공적으로 보내지 못함: Filebeat 서비스는 실행 중이지만, OpenSearch 연결 설정(SSL 포함) 문제 등으로 인해 실제 데이터를 전송하지 못할 수 있습니다.
+해결 방법:
+
+Wazuh Indexer 템플릿 수동 로드 (핵심 해결책): /XDR/wazuh-template.json 파일을 OpenSearch Indexer에 수동으로 다시 푸시합니다. 이 과정은 컨테이너 외부, 즉 호스트 (root@tndserver)에서 직접 수행합니다.
+Bash
+
+# WAZEEH_INDEXER_USERNAME과 WAZUH_INDEXER_PASSWORD는 실제 OpenSearch 사용자명/비밀번호로 대체
+curl -k -u admin:admin -XPUT "https://10.10.20.13:9200/_template/wazuh" -H "Content-Type: application/json" -d@/XDR/wazuh-template.json
+성공하면 {"acknowledged":true}와 같은 응답을 받습니다.
+OpenSearch 인덱스 상태 확인: 템플릿 로드 후, OpenSearch에 wazuh-alerts-* 인덱스가 생성되기 시작하는지 확인합니다.
+Bash
+
+curl -k -u admin:admin "https://10.10.20.13:9200/_cat/indices?v&s=index" | grep wazuh-alerts
+이 명령 결과에 wazuh-alerts-YYYY.MM.DD 형태의 인덱스가 보인다면 데이터가 인덱싱되기 시작했다는 뜻입니다.
+Wazuh Dashboard 새로고침: 모든 과정을 마친 후 웹 브라우저에서 Wazuh Dashboard를 완전히 새로고침(Ctrl+F5 또는 Shift+F5)합니다.
+Wazuh Agent 연결: 위 단계들이 완료되었다면, 이제 에이전트를 Wazuh Manager에 연결합니다. Dashboard의 "Agents" -> "Deploy new agent" 섹션에서 OS 선택 후 Manager IP(예: 10.10.20.13)를 입력하여 설치 명령을 복사, 에이전트 시스템에서 실행합니다. 에이전트로부터 데이터가 들어오기 시작하면 Dashboard의 "Security events" 탭에 알림이 표시될 것입니다.
+
+
+
+
+
+
+
+
